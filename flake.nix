@@ -46,7 +46,6 @@
           default = pkgs.mkShell {
             name = "bask";
             buildInputs = [
-              bask
               hp.cabal-install
               hp.ghc
               hp.ormolu
