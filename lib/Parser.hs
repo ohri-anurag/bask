@@ -112,7 +112,29 @@ command = do
       "readline" -> M.hspace *> fmap ReadLine (Text.strip <<$>> M.optional (M.takeWhile1P (Just "command/readline") (\c -> c /= '|' && c /= '=')))
       "passthru" -> pure PassThru
       -- "lines" -> M.hspace *> (Lines . ExternalCommand . Text.strip <$> M.takeWhile1P (Just "command/lines") (\c -> c /= '|' && c /= '='))
-      _ -> Command . ExternalCommand . Text.strip . (<>) s <$> M.takeWhile1P (Just "command/external") (\c -> c /= '|' && c /= '=')
+      _ ->
+        Command . ExternalCommand . Text.strip . (<>) s <$> parseCommand
+  where
+    parseCommand = do
+      str <- M.takeWhile1P (Just "command/external") (\c -> c /= '|' && c /= '=')
+      atEnd <- M.atEnd
+      if atEnd
+        then pure str
+        else do
+          c1 <- M.try . M.lookAhead $ M.anySingle
+          case c1 of
+            '=' -> do
+              M.char '='
+              c2 <- M.try . M.lookAhead $ M.anySingle
+              if c2 /= '='
+                then do
+                  rest <- parseCommand
+                  pure $ str <> "=" <> rest
+                else do
+                  inp <- M.getInput
+                  M.setInput $ "=" <> inp
+                  pure str
+            _ -> pure str
 
 countInputs :: AtLeastTwo MergeInput -> Int
 countInputs (AtLeastTwo a (b :| rest)) =
