@@ -1,7 +1,7 @@
 module Parser where
 
 import Control.Monad.Combinators.NonEmpty (sepBy1)
-import Data.Char (isSpace)
+import Data.Char (isDigit, isSpace)
 import Data.Text qualified as Text
 import Relude hiding (some)
 import Text.Megaparsec qualified as M
@@ -20,6 +20,7 @@ data Section
   = SingleInput Pipe
   | Merge (AtLeastTwo MergeInput)
   | ReOrder (AtLeastTwo Int)
+  | Concat Int
   deriving (Show, Eq)
 
 data Pipe
@@ -44,8 +45,11 @@ data Command
   | WriteFile Text
   | AppendFile Text
   | PassThru
-  deriving (-- | Lines ExternalCommand
-            Show, Eq)
+  deriving
+    ( -- | Lines ExternalCommand
+      Show,
+      Eq
+    )
 
 newtype ExternalCommand = ExternalCommand Text
   deriving (Show, Eq)
@@ -71,6 +75,13 @@ section =
             case mapMaybe (readMaybe . toString) texts of
               a : b : rest -> pure . ReOrder $ AtLeastTwo a (b :| rest)
               _ -> error "reorder must have at least two arguments!"
+        )
+    <|> ( do
+            M.string "concat" *> M.hspace
+            istr <- M.takeWhile1P (Just "command/concat") isDigit
+            case readMaybe $ toString istr of
+              Just i -> pure $ Concat i
+              Nothing -> error . toText $ "concat command requires an integer specifying the number of inputs to concatenate!\nGiven: " <> istr
         )
     <|> (SingleInput <$> pipe)
 

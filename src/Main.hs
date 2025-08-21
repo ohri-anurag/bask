@@ -74,6 +74,12 @@ executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
                   pure
                     $ fmap snd (sortBy (comparing fst) $ zip newPositions streams)
                     <> resultRest
+        Parser.Concat n ->
+          if n > length streams
+            then error $ "concat command required " <> show n <> " inputs, but only " <> show (length streams) <> " provided!"
+            else
+              let (toConcat, rest) = splitAt n streams
+               in fmap (mconcat toConcat :) $ helper2 sectionRest rest
 
     helper3 mergeInputs@(Parser.AtLeastTwo a (b :| rest)) streams =
       let streamCount = length streams
