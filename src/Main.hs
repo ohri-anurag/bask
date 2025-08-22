@@ -22,7 +22,7 @@ main = do
         Right xs -> do
           -- print xs
           ee <- runExceptT $ executePipeline xs B.empty
-          whenLeft_ ee print
+          whenLeft_ ee TIO.putStrLn
     [] -> putStrLn "Error: No arguments provided.\nbask requires a file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
     _ -> putStrLn "Error: Too many arguments provided.\nbask requires a single file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
 
