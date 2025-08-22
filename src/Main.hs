@@ -6,8 +6,9 @@ import Data.ByteString.Char8 qualified as B
 import Data.Text.IO qualified as TIO
 import Parser qualified as Parser
 import Relude
+import System.Exit (ExitCode (..))
 import System.IO (hClose, hSetBinaryMode)
-import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell)
+import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
 import Text.Megaparsec (parse)
 
 main :: IO ()
@@ -120,7 +121,7 @@ executeCommand (Parser.Command cmd) stream = executeExternalCommand cmd stream
 
 executeExternalCommand :: Parser.ExternalCommand -> ByteString -> MyMonad ByteString
 executeExternalCommand (Parser.ExternalCommand cmd) stream = do
-  (mStdin, mStdout, mStderr, _) <- lift $ do
+  (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
     hSetBinaryMode writeEnd True
     B.hPut writeEnd stream
@@ -135,7 +136,8 @@ executeExternalCommand (Parser.ExternalCommand cmd) stream = do
 
       errBytes <- lift $ B.hGetContents err
       outBytes <- lift $ B.hGetContents out
-      if B.null errBytes
-        then pure outBytes
-        else throwError $ decodeUtf8 errBytes
+      exitCode <- lift $ waitForProcess procHandle
+      case exitCode of
+        ExitSuccess -> pure outBytes
+        ExitFailure _ -> throwError . decodeUtf8 $ errBytes <> outBytes
     _ -> throwError "Failed to create output handle"
