@@ -1,13 +1,14 @@
 module Parser where
 
-import Control.Monad.Combinators.NonEmpty (sepBy1)
-import Data.Char (isDigit, isSpace)
+import Control.Monad.Except (throwError)
+import Data.Char (isDigit)
 import Data.Text qualified as Text
 import Relude hiding (some)
-import Text.Megaparsec qualified as M
-import Text.Megaparsec.Char qualified as M
 
 data AtLeastTwo a = AtLeastTwo a (NonEmpty a)
+  deriving (Show, Eq)
+
+newtype Script = Script (NonEmpty Pipeline)
   deriving (Show, Eq)
 
 newtype Pipeline = Pipeline (NonEmpty Step)
@@ -18,7 +19,7 @@ newtype Step = Step (NonEmpty Section)
 
 data Section
   = SingleInput Pipe
-  | Merge (AtLeastTwo MergeInput)
+  | Merge (AtLeastTwo Text)
   | ReOrder (AtLeastTwo Int)
   | Concat Int
   deriving (Show, Eq)
@@ -28,11 +29,6 @@ data Pipe
   | SharedPipe (AtLeastTwo PipeCommand)
   deriving (Show, Eq)
 
-data MergeInput
-  = JustText Text
-  | InputPipe
-  deriving (Show, Eq)
-
 data PipeCommand
   = PipelineCommand Pipeline
   | SingleCommand Command
@@ -40,10 +36,11 @@ data PipeCommand
 
 data Command
   = Command ExternalCommand
-  | ReadLine (Maybe Text)
+  | ReadLine Text
   | WriteLine Text
   | WriteFile Text
   | AppendFile Text
+  | ShowOutput ExternalCommand
   | PassThru
   deriving
     ( -- | Lines ExternalCommand
@@ -51,97 +48,193 @@ data Command
       Eq
     )
 
-newtype ExternalCommand = ExternalCommand Text
+newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
   deriving (Show, Eq)
 
-type Parser = M.Parsec () Text
+data CommandText
+  = JustText Text
+  | Argument Int
+  deriving (Show, Eq)
 
-pipeline :: Parser Pipeline
-pipeline =
-  Pipeline <$> sepBy1 step (M.char '|' *> M.hspace)
+data ParserState = ParserState
+  { line :: Int,
+    column :: Int,
+    input :: Text
+  }
+  deriving (Show)
 
-step :: Parser Step
-step = Step <$> sepBy1 section (M.hspace *> M.string "||" *> M.hspace) <* M.space
+data Error = Error Text ParserState
+  deriving (Show)
 
-section :: Parser Section
-section =
-  ( do
-      M.string "merge" *> M.hspace
-      Merge <$> mergeInput
-  )
-    <|> ( do
-            M.string "reorder" *> M.hspace
-            texts <- Text.words . Text.strip <$> M.takeWhile1P (Just "command/writeline") (\c -> c /= '|' && c /= '=')
-            case mapMaybe (readMaybe . toString) texts of
-              a : b : rest -> pure . ReOrder $ AtLeastTwo a (b :| rest)
-              _ -> error "reorder must have at least two arguments!"
-        )
-    <|> ( do
-            M.string "concat" *> M.hspace
-            istr <- M.takeWhile1P (Just "command/concat") isDigit
-            case readMaybe $ toString istr of
-              Just i -> pure $ Concat i
-              Nothing -> error . toText $ "concat command requires an integer specifying the number of inputs to concatenate!\nGiven: " <> istr
-        )
-    <|> (SingleInput <$> pipe)
+type Parser = ExceptT Error (State ParserState)
 
-mergeInput :: Parser (AtLeastTwo MergeInput)
-mergeInput =
-  M.takeWhile1P (Just "string") (\c -> c /= '|' && c /= '=') >>= \s ->
-    case intersperse InputPipe $ fmap JustText $ Text.splitOn "pipe" s of
-      a : b : rest -> pure $ AtLeastTwo a (b :| rest)
-      _ -> fail "merge command needs at least two inputs!"
+parse :: Parser a -> Text -> Either Error a
+parse parser input = evalState (runExceptT parser) $ ParserState 1 1 input
 
-pipe :: Parser Pipe
-pipe = do
-  a :| rest <- sepBy1 pipeCommand (M.string "==" *> M.hspace)
-  pure $ case rest of
-    b : bs -> SharedPipe $ AtLeastTwo a (b :| bs)
-    [] -> SinglePipe a
+peek :: Int -> Parser Text
+peek i = do
+  ParserState {input} <- get
+  pure $ Text.take i input
+
+consume :: Char -> Parser ()
+consume c = do
+  st@ParserState {..} <- get
+  case Text.uncons input of
+    Nothing -> throwError $ Error ("Expected: " <> show c <> ", but reached End of Input!") st
+    Just (i, rest) ->
+      if i == c
+        then put st {input = rest, column = if c == '\n' then 0 else succ column, line = if c == '\n' then succ line else line}
+        else throwError $ Error ("Expected: " <> show c <> ", but received: " <> show i) st
+
+newline :: Parser ()
+newline = consume '\n'
+
+space :: Parser ()
+space = consume ' '
+
+string :: Text -> Parser ()
+string = traverse_ consume . Text.unpack
+
+word :: Parser Text
+word = consumeWhile (\c -> not (c == ' ' || c == '\n'))
+
+consumeWhile :: (Char -> Bool) -> Parser Text
+consumeWhile cond = do
+  st@ParserState {input} <- get
+  let (l, r) = Text.span cond input
+  put st {input = r} $> l
+
+isSeparator :: Char -> Bool
+isSeparator c = c == '|' || c == '=' || c == '\n'
+
+textBlocks :: Bool -> Parser Text
+textBlocks isExternal = Text.pack . reverse <$> helper []
+  where
+    helper acc = do
+      peek 2 >>= \case
+        "||" -> pure acc
+        "==" -> pure acc
+        "\\$" -> string "\\$" *> helper ('$' : acc)
+        s -> case Text.uncons s of
+          Nothing -> pure acc
+          Just (c, _) ->
+            case c of
+              '\n' -> pure acc
+              '$' ->
+                if isExternal
+                  then pure acc
+                  else consume '$' *> helper ('$' : acc)
+              _ -> consume c *> helper (c : acc)
+
+textBlock :: Parser Text
+textBlock = textBlocks False
+
+command :: Parser Command
+command =
+  word >>= \case
+    "readline" -> space *> fmap (ReadLine . Text.strip) textBlock
+    "writeline" -> space *> fmap (WriteLine . Text.strip) textBlock
+    "writefile" -> space *> fmap (WriteFile . Text.strip) textBlock
+    "appendfile" -> space *> fmap (AppendFile . Text.strip) textBlock
+    "show" -> space *> fmap ShowOutput externalCommand
+    "passthru" -> pure PassThru
+    w -> do
+      modify $ \st@(ParserState {input}) -> st {input = w <> input}
+      Command <$> externalCommand
+  where
+    externalCommand =
+      ExternalCommand <$> do
+        a <- JustText <$> textBlocks True
+        (a :|) <$> helper
+    helper = do
+      peek 1 >>= \case
+        "$" -> do
+          consume '$'
+          st <- get
+          nstr <- consumeWhile isDigit
+          n <- hoistEither . bimap (\e -> Error e st) Argument . readEither $ toString nstr
+          when (n == Argument 0) $ throwError $ Error "Arguments passed from bash must be numbered starting from 1!" st
+          b <- JustText <$> textBlocks True
+          helper <&> \x -> n : b : x
+        _ -> pure []
 
 pipeCommand :: Parser PipeCommand
 pipeCommand = SingleCommand <$> command
 
-command :: Parser Command
-command = do
-  M.takeWhile1P (Just "command/singlecommand") (not . isSpace) >>= \s ->
-    case s of
-      "writefile" -> M.hspace *> (WriteFile . Text.strip <$> M.takeWhile1P (Just "command/writefile") (\c -> c /= '|' && c /= '='))
-      "appendfile" -> M.hspace *> (AppendFile . Text.strip <$> M.takeWhile1P (Just "command/appendfile") (\c -> c /= '|' && c /= '='))
-      "writeline" -> M.hspace *> (WriteLine . Text.strip <$> M.takeWhile1P (Just "command/writeline") (\c -> c /= '|' && c /= '='))
-      "readline" -> M.hspace *> fmap ReadLine (Text.strip <<$>> M.optional (M.takeWhile1P (Just "command/readline") (\c -> c /= '|' && c /= '=')))
-      "passthru" -> pure PassThru
-      -- "lines" -> M.hspace *> (Lines . ExternalCommand . Text.strip <$> M.takeWhile1P (Just "command/lines") (\c -> c /= '|' && c /= '='))
-      _ ->
-        Command . ExternalCommand . Text.strip . (<>) s <$> parseCommand
+pipe :: Parser Pipe
+pipe = do
+  a <- pipeCommand
+  helper >>= \case
+    [] -> pure $ SinglePipe a
+    b : rest -> pure $ SharedPipe (AtLeastTwo a (b :| rest))
   where
-    parseCommand = do
-      str <- M.takeWhile1P (Just "command/external") (\c -> c /= '|' && c /= '=')
-      atEnd <- M.atEnd
-      if atEnd
-        then pure str
-        else do
-          c1 <- M.try . M.lookAhead $ M.anySingle
-          case c1 of
-            '=' -> do
-              M.char '='
-              c2 <- M.try . M.lookAhead $ M.anySingle
-              if c2 /= '='
-                then do
-                  rest <- parseCommand
-                  pure $ str <> "=" <> rest
-                else do
-                  inp <- M.getInput
-                  M.setInput $ "=" <> inp
-                  pure str
-            _ -> pure str
+    helper = do
+      peek 2 >>= \case
+        "==" -> do
+          string "==" *> space
+          a <- pipeCommand
+          (a :) <$> helper
+        _ -> pure []
 
-countInputs :: AtLeastTwo MergeInput -> Int
-countInputs (AtLeastTwo a (b :| rest)) =
-  sum
-    $ mapMaybe
-      ( \x -> case x of
-          InputPipe -> Just 1
-          _ -> Nothing
-      )
-      (a : b : rest)
+section :: Parser Section
+section =
+  word >>= \case
+    "merge" ->
+      space *> do
+        Text.splitOn "pipe" <$> textBlock >>= \case
+          a : b : rest -> pure . Merge . AtLeastTwo a $ b :| rest
+          _ -> get >>= throwError . Error ("merge command requires at least two strings to merge, separated by the literal string `pipe`!")
+    "reorder" ->
+      space *> do
+        fmap (mapMaybe (readMaybe . toString) . Text.words) textBlock >>= \case
+          a : b : rest -> pure . ReOrder . AtLeastTwo a $ b :| rest
+          _ -> get >>= throwError . Error ("reorder command requires at least two integers!")
+    "concat" ->
+      space *> do
+        fmap (readMaybe . toString) textBlock >>= \case
+          Just i -> pure $ Concat i
+          Nothing -> get >>= throwError . Error ("concat command requires at least one integer!")
+    w -> do
+      st@ParserState {input} <- get
+      put st {input = w <> input}
+      SingleInput <$> pipe
+
+step :: Parser Step
+step = do
+  a <- section
+  (Step . (:|) a) <$> helper
+  where
+    helper = do
+      peek 2 >>= \case
+        "||" -> do
+          string "||" *> space
+          b <- section
+          (b :) <$> helper
+        _ -> pure []
+
+pipeline :: Parser Pipeline
+pipeline = do
+  a <- step
+  (Pipeline . (:|) a) <$> helper
+  where
+    helper = do
+      peek 2 >>= \case
+        "\n|" -> do
+          string "\n|" *> space
+
+          b <- step
+          (b :) <$> helper
+        _ -> pure []
+
+script :: Parser Script
+script = do
+  a <- pipeline
+  (Script . (:|) a) <$> helper
+  where
+    helper = do
+      peek 2 >>= \case
+        "\n\n" -> do
+          string "\n\n"
+          b <- pipeline
+          (b :) <$> helper
+        _ -> pure []

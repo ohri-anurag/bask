@@ -2,70 +2,58 @@ module Main where
 
 import Control.Monad (foldM)
 import Control.Monad.Except (throwError)
-import Data.ByteString.Char8 qualified as B
+import Data.ByteString.Char8 qualified as SB
+import Data.ByteString.Lazy.Char8 qualified as B
+import Data.Text qualified as Text
 import Data.Text.IO qualified as TIO
+import Data.Traversable (for)
 import Parser qualified as Parser
 import Relude
 import System.Exit (ExitCode (..))
 import System.IO (hClose, hSetBinaryMode)
 import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
-import Text.Megaparsec (parse)
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
-    [fileName] -> do
+    fileName : _ -> do
       bytes <- decodeUtf8 <$> readFileBS fileName
-      case parse Parser.pipeline "example" bytes of
+      case Parser.parse Parser.script bytes of
         Left b -> print b
         Right xs -> do
-          -- print xs
-          ee <- runExceptT $ executePipeline xs B.empty
-          whenLeft_ ee TIO.putStrLn
+          ee <- runExceptT $ executeScript xs
+          case ee of
+            Left err -> TIO.putStrLn err
+            Right out -> traverse_ B.putStrLn out
     [] -> putStrLn "Error: No arguments provided.\nbask requires a file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
-    _ -> putStrLn "Error: Too many arguments provided.\nbask requires a single file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
 
 type MyMonad = ExceptT Text IO
 
-executePipeline :: Parser.Pipeline -> ByteString -> MyMonad [ByteString]
+executeScript :: Parser.Script -> MyMonad [LByteString]
+executeScript (Parser.Script pipelines) = fmap concat $ for pipelines $ \p -> lift (print p) *> executePipeline p mempty
+
+executePipeline :: Parser.Pipeline -> LByteString -> MyMonad [LByteString]
 executePipeline (Parser.Pipeline steps) stream = foldM (flip executeStep) (repeat stream) steps
 
-executeStep :: Parser.Step -> [ByteString] -> MyMonad [ByteString]
+executeStep :: Parser.Step -> [LByteString] -> MyMonad [LByteString]
 executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
   where
-    -- helper (section :| sectionRest) streams@(stream :| streamRest) =
-    --   case section of
-    --     Parser.SingleInput pipe -> NonEmpty.appendList (executePipe pipe stream) $ helper2 sectionRest streamRest
-    --     Parser.Merge mergeInputs ->
-    --       let inputCount = Parser.countInputs mergeInputs
-    --           (forMerge, rest) = NonEmpty.splitAt inputCount streams
-    --        in helper3 mergeInputs forMerge :| helper2 sectionRest rest
-    --     Parser.ReOrder (Parser.AtLeastTwo a rest) ->
-    --       let newPositions = a NonEmpty.<| rest
-    --        in -- executedStreams = (\s -> SC.mwrap $! fmap (\c -> SC.fromStrict $! seq (rnf c) c) $! SC.toStrict_ $! seq s s) <$> streams
-    --           -- executedStreams = seq (traverse (fmap rnf . SC.toStrict_) streams) streams
-    --           if length newPositions > length streams
-    --             then error "reorder command doesn't have enough streams to re-order!"
-    --             else do
-    --               bytestrings <- lift $ traverse SC.toLazy_ streams
-    --
-    --               NonEmpty.appendList
-    --                 (fmap (SC.fromLazy . snd) $ NonEmpty.sortBy (comparing fst) $ NonEmpty.zip newPositions bytestrings)
-    --                 (helper2 sectionRest $ NonEmpty.drop (length newPositions) streams)
-
-    helper2 :: [Parser.Section] -> [ByteString] -> MyMonad [ByteString]
+    helper2 :: [Parser.Section] -> [LByteString] -> MyMonad [LByteString]
     helper2 [] _ = pure []
-    helper2 sections [] = helper2 sections $ repeat B.empty
+    helper2 sections [] = helper2 sections $ repeat mempty
     helper2 (section : sectionRest) streams@(stream : streamRest) =
       case section of
         Parser.SingleInput pipe -> (<>) <$> executePipe pipe stream <*> helper2 sectionRest streamRest
-        Parser.Merge mergeInputs ->
-          let inputCount = Parser.countInputs mergeInputs
-              (forMerge, rest) = splitAt inputCount streams
-           in do
-                resultRest <- helper2 sectionRest rest
-                pure $ helper3 mergeInputs forMerge : resultRest
+        Parser.Merge (Parser.AtLeastTwo a (b :| rest)) ->
+          let streamCount = length streams
+              inputs = fmap encodeUtf8 $ a :| b : rest
+              inputCount = length inputs
+              mergeResult =
+                if inputCount > streamCount + 1
+                  then error "merge command is asking for more inputs than available from previous step!"
+                  else mconcat $ zipWith (<>) (init inputs) streams <> [last inputs]
+           in (mergeResult :) <$> helper2 sectionRest (drop (inputCount - 1) streams)
         Parser.ReOrder (Parser.AtLeastTwo a (b :| rest)) ->
           let newPositions = a : b : rest
            in if length newPositions > length streams
@@ -82,45 +70,36 @@ executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
               let (toConcat, rest) = splitAt n streams
                in fmap (mconcat toConcat :) $ helper2 sectionRest rest
 
-    helper3 mergeInputs@(Parser.AtLeastTwo a (b :| rest)) streams =
-      let streamCount = length streams
-          inputCount = Parser.countInputs mergeInputs
-       in if streamCount < inputCount
-            then error $ toText $ "merge command is asking for more inputs than available from previous step!" ++ show mergeInputs
-            else mconcat $ helper4 (a : b : rest) streams
-
-    helper4 :: [Parser.MergeInput] -> [ByteString] -> [ByteString]
-    helper4 [] [] = []
-    helper4 (Parser.JustText text : rest) streams = (encodeUtf8 text) : helper4 rest streams
-    helper4 (Parser.InputPipe : rest) (stream : srest) = stream : helper4 rest srest
-    helper4 _ _ = error "Panic!"
-
-executePipe :: Parser.Pipe -> ByteString -> MyMonad [ByteString]
+executePipe :: Parser.Pipe -> LByteString -> MyMonad [LByteString]
 executePipe (Parser.SinglePipe pipeCommand) stream = executePipeCommand pipeCommand stream
 executePipe (Parser.SharedPipe (Parser.AtLeastTwo x xs)) stream = concat <$> traverse (flip executePipeCommand stream) (x : toList xs)
 
-executePipeCommand :: Parser.PipeCommand -> ByteString -> MyMonad [ByteString]
+executePipeCommand :: Parser.PipeCommand -> LByteString -> MyMonad [LByteString]
 executePipeCommand (Parser.PipelineCommand pipeline) stream = executePipeline pipeline stream
 executePipeCommand (Parser.SingleCommand command) stream = one <$> executeCommand command stream
 
-executeCommand :: Parser.Command -> ByteString -> MyMonad ByteString
-executeCommand (Parser.ReadLine prompt) _ = lift (for_ prompt (TIO.putStr . flip (<>) " ")) >> hFlush stdout >> helper
+executeCommand :: Parser.Command -> LByteString -> MyMonad LByteString
+executeCommand (Parser.ReadLine prompt) _ = lift (TIO.putStr $ prompt <> " ") >> hFlush stdout >> helper
   where
     helper = do
-      bytes <- lift B.getLine
+      bytes <- B.fromStrict <$> lift SB.getLine
       if B.null bytes
         then helper
         else pure bytes
 executeCommand Parser.PassThru s = pure s
--- executeCommand (Parser.Lines cmd) stream = SC.unlines $ S.maps (executeExternalCommand cmd) $ SC.denull $ SC.lines stream
 executeCommand (Parser.WriteLine text) stream =
   lift (TIO.putStrLn text) $> stream
-executeCommand (Parser.WriteFile path) stream = lift (writeFileBS (toString path) stream) $> B.empty
-executeCommand (Parser.AppendFile path) stream = lift (appendFileBS (toString path) stream) $> B.empty
-executeCommand (Parser.Command cmd) stream = executeExternalCommand cmd stream
+executeCommand (Parser.WriteFile path) stream = lift (writeFileLBS (toString path) stream) $> mempty
+executeCommand (Parser.AppendFile path) stream = lift (appendFileLBS (toString path) stream) $> mempty
+executeCommand (Parser.ShowOutput cmd) stream = executeExternalCommand cmd stream True
+executeCommand (Parser.Command cmd) stream = executeExternalCommand cmd stream False
 
-executeExternalCommand :: Parser.ExternalCommand -> ByteString -> MyMonad ByteString
-executeExternalCommand (Parser.ExternalCommand cmd) stream = do
+executeExternalCommand :: Parser.ExternalCommand -> LByteString -> Bool -> MyMonad LByteString
+executeExternalCommand (Parser.ExternalCommand splits) stream isShow = do
+  arguments <- toText <<$>> lift getArgs
+  cmd <- fmap (Text.concat . toList) $ for splits $ \case
+    Parser.JustText t -> pure t
+    Parser.Argument i -> maybeToExceptT "" $ hoistMaybe $ arguments !!? i
   (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
     hSetBinaryMode writeEnd True
@@ -136,6 +115,7 @@ executeExternalCommand (Parser.ExternalCommand cmd) stream = do
 
       errBytes <- lift $ B.hGetContents err
       outBytes <- lift $ B.hGetContents out
+      when isShow $ lift $ B.putStr outBytes
       exitCode <- lift $ waitForProcess procHandle
       case exitCode of
         ExitSuccess -> pure outBytes

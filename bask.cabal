@@ -57,8 +57,11 @@ common warnings
   default-extensions:
     DataKinds
     ImportQualifiedPost
+    LambdaCase
+    NamedFieldPuns
     NoImplicitPrelude
     OverloadedStrings
+    RecordWildCards
     ScopedTypeVariables
     TypeApplications
 
@@ -68,9 +71,8 @@ common warnings
   -- Other library packages from which modules are imported.
   build-depends:
     , base
-    , megaparsec          ^>=9.7.0
-    , parser-combinators  ^>=1.3.0
-    , relude              ^>=1.2.2.0
+    , mtl
+    , relude  ^>=1.2.2.0
 
 library
   import:          warnings
@@ -98,5 +100,4 @@ executable bask
     , bask
     , bytestring
     , exceptions  ^>=0.10.7
-    , mtl
     , process
