@@ -130,7 +130,10 @@ command =
     "writefile" -> space *> fmap (WriteFile . Text.strip) textBlock
     "appendfile" -> space *> fmap (AppendFile . Text.strip) textBlock
     "show" -> space *> fmap ShowOutput externalCommand
-    "passthru" -> pure PassThru
+    "passthru" -> do
+      peek 1 >>= \case
+        " " -> consume ' ' $> PassThru
+        _ -> pure PassThru
     w -> do
       modify $ \st@(ParserState {input}) -> st {input = w <> input}
       Command <$> externalCommand

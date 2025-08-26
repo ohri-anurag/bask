@@ -31,7 +31,7 @@ main = do
 type MyMonad = ExceptT Text IO
 
 executeScript :: Parser.Script -> MyMonad [LByteString]
-executeScript (Parser.Script pipelines) = fmap concat $ for pipelines $ \p -> lift (print p) *> executePipeline p mempty
+executeScript (Parser.Script pipelines) = fmap concat $ for pipelines $ \p -> executePipeline p mempty
 
 executePipeline :: Parser.Pipeline -> LByteString -> MyMonad [LByteString]
 executePipeline (Parser.Pipeline steps) stream = foldM (flip executeStep) (repeat stream) steps
