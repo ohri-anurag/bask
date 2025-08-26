@@ -86,9 +86,6 @@ consume c = do
         then put st {input = rest, column = if c == '\n' then 0 else succ column, line = if c == '\n' then succ line else line}
         else throwError $ Error ("Expected: " <> show c <> ", but received: " <> show i) st
 
-newline :: Parser ()
-newline = consume '\n'
-
 space :: Parser ()
 space = consume ' '
 
@@ -100,9 +97,9 @@ word = consumeWhile (\c -> not (c == ' ' || c == '\n'))
 
 consumeWhile :: (Char -> Bool) -> Parser Text
 consumeWhile cond = do
-  st@ParserState {input} <- get
-  let (l, r) = Text.span cond input
-  put st {input = r} $> l
+  ParserState {input} <- get
+  let (l, _) = Text.span cond input
+  string l $> l
 
 isSeparator :: Char -> Bool
 isSeparator c = c == '|' || c == '=' || c == '\n'
