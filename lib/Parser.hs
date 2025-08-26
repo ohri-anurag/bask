@@ -19,7 +19,7 @@ newtype Step = Step (NonEmpty Section)
 
 data Section
   = SingleInput Pipe
-  | Merge (AtLeastTwo Text)
+  | Merge (AtLeastTwo CommandText)
   | ReOrder (AtLeastTwo Int)
   | Concat Int
   deriving (Show, Eq)
@@ -100,27 +100,40 @@ consumeWhile cond = do
 isSeparator :: Char -> Bool
 isSeparator c = c == '|' || c == '=' || c == '\n'
 
-textBlocks :: Bool -> Parser Text
-textBlocks isExternal = Text.pack . reverse <$> helper []
+textBlock :: Parser Text
+textBlock = Text.pack . reverse <$> helper []
   where
     helper acc = do
       peek 2 >>= \case
         "||" -> pure acc
         "==" -> pure acc
-        "\\$" -> string "\\$" *> helper ('$' : acc)
         s -> case Text.uncons s of
           Nothing -> pure acc
           Just (c, _) ->
             case c of
               '\n' -> pure acc
-              '$' ->
-                if isExternal
-                  then pure acc
-                  else consume '$' *> helper ('$' : acc)
+              '$' -> consume '$' *> helper ('$' : acc)
               _ -> consume c *> helper (c : acc)
 
-textBlock :: Parser Text
-textBlock = textBlocks False
+commandText :: Parser [CommandText]
+commandText =
+  peek 1 >>= \case
+    "\n" -> pure []
+    "$" -> do
+      consume '$'
+      st <- get
+      nstr <- consumeWhile isDigit
+      n <- hoistEither . bimap (\e -> Error e st) Argument . readEither $ toString nstr
+      when (n == Argument 0) $ throwError $ Error "Arguments passed from bash must be numbered starting from 1!" st
+      (n :) <$> commandText
+    _ ->
+      peek 2 >>= \case
+        "||" -> pure []
+        "==" -> pure []
+        "\\$" -> consume '\\' *> commandText
+        _ -> do
+          str <- consumeWhile (\c -> not $ c == '$' || c == '|' || c == '=' || c == '\n')
+          (JustText str :) <$> commandText
 
 command :: Parser Command
 command =
@@ -139,20 +152,9 @@ command =
       Command <$> externalCommand
   where
     externalCommand =
-      ExternalCommand <$> do
-        a <- JustText <$> textBlocks True
-        (a :|) <$> helper
-    helper = do
-      peek 1 >>= \case
-        "$" -> do
-          consume '$'
-          st <- get
-          nstr <- consumeWhile isDigit
-          n <- hoistEither . bimap (\e -> Error e st) Argument . readEither $ toString nstr
-          when (n == Argument 0) $ throwError $ Error "Arguments passed from bash must be numbered starting from 1!" st
-          b <- JustText <$> textBlocks True
-          helper <&> \x -> n : b : x
-        _ -> pure []
+      commandText >>= \case
+        [] -> get >>= throwError . Error "Expected at least one word for this section/step!"
+        a : as -> pure $ ExternalCommand $ a :| as
 
 pipeCommand :: Parser PipeCommand
 pipeCommand = SingleCommand <$> command
@@ -175,11 +177,11 @@ pipe = do
 section :: Parser Section
 section =
   word >>= \case
-    "merge" ->
-      space *> do
-        Text.splitOn "pipe" <$> textBlock >>= \case
-          a : b : rest -> pure . Merge . AtLeastTwo a $ b :| rest
-          _ -> get >>= throwError . Error ("merge command requires at least two strings to merge, separated by the literal string `pipe`!")
+    "merge" -> do
+      space
+      commandText >>= \case
+        a : b : rest -> pure . Merge . AtLeastTwo a $ b :| rest
+        _ -> get >>= throwError . Error "Expected at least two arguments for merge command!"
     "reorder" ->
       space *> do
         fmap (mapMaybe (readMaybe . toString) . Text.words) textBlock >>= \case

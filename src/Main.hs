@@ -9,6 +9,7 @@ import Data.Text.IO qualified as TIO
 import Data.Traversable (for)
 import Parser qualified as Parser
 import Relude
+import Relude.Extra.Foldable1 (maximum1)
 import System.Exit (ExitCode (..))
 import System.IO (hClose, hSetBinaryMode)
 import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
@@ -45,15 +46,17 @@ executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
     helper2 (section : sectionRest) streams@(stream : streamRest) =
       case section of
         Parser.SingleInput pipe -> (<>) <$> executePipe pipe stream <*> helper2 sectionRest streamRest
-        Parser.Merge (Parser.AtLeastTwo a (b :| rest)) ->
-          let streamCount = length streams
-              inputs = fmap encodeUtf8 $ a :| b : rest
-              inputCount = length inputs
-              mergeResult =
-                if inputCount > streamCount + 1
-                  then error "merge command is asking for more inputs than available from previous step!"
-                  else mconcat $ zipWith (<>) (init inputs) streams <> [last inputs]
-           in (mergeResult :) <$> helper2 sectionRest (drop (inputCount - 1) streams)
+        Parser.Merge (Parser.AtLeastTwo a (b :| rest)) -> do
+          let inputs = a :| b : rest
+              maxInput =
+                maximum1 $ inputs <&> \c -> case c of
+                  Parser.JustText _ -> 0
+                  Parser.Argument i -> i
+          mergeResult <-
+            fmap (B.concat . toList) $ for inputs $ \case
+              Parser.JustText txt -> pure $ encodeUtf8 txt
+              Parser.Argument i -> maybeToExceptT ("Couldn't find input from previous step for merge command for number: " <> show i) $ hoistMaybe $ streams !!? pred i
+          (mergeResult :) <$> helper2 sectionRest (drop maxInput streams)
         Parser.ReOrder (Parser.AtLeastTwo a (b :| rest)) ->
           let newPositions = a : b : rest
            in if length newPositions > length streams
@@ -99,7 +102,7 @@ executeExternalCommand (Parser.ExternalCommand splits) stream isShow = do
   arguments <- toText <<$>> lift getArgs
   cmd <- fmap (Text.concat . toList) $ for splits $ \case
     Parser.JustText t -> pure t
-    Parser.Argument i -> maybeToExceptT "" $ hoistMaybe $ arguments !!? i
+    Parser.Argument i -> maybeToExceptT ("Couldn't find external argument for number: " <> show i) $ hoistMaybe $ arguments !!? i
   (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
     hSetBinaryMode writeEnd True
