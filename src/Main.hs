@@ -57,15 +57,6 @@ executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
               Parser.JustText txt -> pure $ encodeUtf8 txt
               Parser.Argument i -> maybeToExceptT ("Couldn't find input from previous step for merge command for number: " <> show i) $ hoistMaybe $ streams !!? pred i
           (mergeResult :) <$> helper2 sectionRest (drop maxInput streams)
-        Parser.ReOrder (Parser.AtLeastTwo a (b :| rest)) ->
-          let newPositions = a : b : rest
-           in if length newPositions > length streams
-                then error "reorder command doesn't have enough streams to re-order!"
-                else do
-                  resultRest <- helper2 sectionRest (drop (length newPositions) streams)
-                  pure
-                    $ fmap snd (sortBy (comparing fst) $ zip newPositions streams)
-                    <> resultRest
         Parser.Concat n ->
           if n > length streams
             then error $ "concat command required " <> show n <> " inputs, but only " <> show (length streams) <> " provided!"

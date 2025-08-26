@@ -20,7 +20,6 @@ newtype Step = Step (NonEmpty Section)
 data Section
   = SingleInput Pipe
   | Merge (AtLeastTwo CommandText)
-  | ReOrder (AtLeastTwo Int)
   | Concat Int
   deriving (Show, Eq)
 
@@ -182,11 +181,6 @@ section =
       commandText >>= \case
         a : b : rest -> pure . Merge . AtLeastTwo a $ b :| rest
         _ -> get >>= throwError . Error "Expected at least two arguments for merge command!"
-    "reorder" ->
-      space *> do
-        fmap (mapMaybe (readMaybe . toString) . Text.words) textBlock >>= \case
-          a : b : rest -> pure . ReOrder . AtLeastTwo a $ b :| rest
-          _ -> get >>= throwError . Error ("reorder command requires at least two integers!")
     "concat" ->
       space *> do
         fmap (readMaybe . toString) textBlock >>= \case
