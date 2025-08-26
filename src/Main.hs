@@ -114,7 +114,10 @@ executeExternalCommand (Parser.ExternalCommand splits) stream isShow = do
         hSetBinaryMode err True
 
       errBytes <- lift $ B.hGetContents err
-      outBytes <- lift $ B.hGetContents out
+      outBytes <-
+        if isShow
+          then pure mempty
+          else lift $ B.hGetContents out
       when isShow $ lift $ B.putStr outBytes
       exitCode <- lift $ waitForProcess procHandle
       case exitCode of
