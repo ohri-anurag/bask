@@ -42,11 +42,7 @@ data Command
   | AppendFile Text
   | ShowOutput ExternalCommand
   | PassThru
-  deriving
-    ( -- | Lines ExternalCommand
-      Show,
-      Eq
-    )
+  deriving (Show, Eq)
 
 newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
   deriving (Show, Eq)
