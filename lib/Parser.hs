@@ -125,14 +125,21 @@ commandText =
       n <- hoistEither . bimap (\e -> Error e st) Argument . readEither $ toString nstr
       when (n == Argument 0) $ throwError $ Error "Arguments passed from bash must be numbered starting from 1!" st
       (n :) <$> commandText
-    _ ->
+    _ -> helper []
+  where
+    toJust = pure . one . JustText . Text.pack . reverse
+    helper acc =
       peek 2 >>= \case
-        "||" -> pure []
-        "==" -> pure []
-        "\\$" -> consume '\\' *> commandText
-        _ -> do
-          str <- consumeWhile (\c -> not $ c == '$' || c == '|' || c == '=' || c == '\n')
-          (JustText str :) <$> commandText
+        "||" -> toJust acc
+        "==" -> toJust acc
+        "\\$" -> string "\\$" *> helper ('$' : acc)
+        s -> case Text.uncons s of
+          Nothing -> toJust acc
+          Just (c, _) ->
+            case c of
+              '$' -> (JustText (Text.pack $ reverse acc) :) <$> commandText
+              '\n' -> toJust acc
+              _ -> consume c *> helper (c : acc)
 
 command :: Parser Command
 command =
@@ -213,7 +220,6 @@ pipeline = do
       peek 2 >>= \case
         "\n|" -> do
           string "\n|" *> space
-
           b <- step
           (b :) <$> helper
         _ -> pure []
