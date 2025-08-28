@@ -25,7 +25,7 @@ main = do
         Right xs -> do
           ee <- runExceptT $ executeScript xs
           case ee of
-            Left err -> TIO.putStrLn err
+            Left err -> TIO.putStrLn err *> exitFailure
             Right out -> traverse_ B.putStrLn out
     [] -> putStrLn "Error: No arguments provided.\nbask requires a file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
 
