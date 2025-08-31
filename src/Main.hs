@@ -4,12 +4,11 @@ import Control.Monad (foldM)
 import Control.Monad.Except (throwError)
 import Data.ByteString.Char8 qualified as SB
 import Data.ByteString.Lazy.Char8 qualified as B
-import Data.Text qualified as Text
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Text.IO qualified as TIO
 import Data.Traversable (for)
 import Parser qualified as Parser
 import Relude
-import Relude.Extra.Foldable1 (maximum1)
 import System.Exit (ExitCode (..))
 import System.IO (hClose, hSetBinaryMode)
 import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
@@ -29,78 +28,58 @@ main = do
             Right out -> traverse_ B.putStrLn out
     [] -> putStrLn "Error: No arguments provided.\nbask requires a file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
 
+zipWithMN :: (Applicative m) => (a -> b -> m c) -> NonEmpty a -> NonEmpty b -> m (NonEmpty c)
+zipWithMN f (a :| as) (b :| bs) = (:|) <$> f a b <*> zipWithM f as bs
+
 type MyMonad = ExceptT Text IO
 
-executeScript :: Parser.Script -> MyMonad [LByteString]
-executeScript (Parser.Script pipelines) = fmap concat $ for pipelines $ \p -> executePipeline p mempty
+type Input = LByteString
 
-executePipeline :: Parser.Pipeline -> LByteString -> MyMonad [LByteString]
-executePipeline (Parser.Pipeline steps) stream = foldM (flip executeStep) (repeat stream) steps
+type Arguments = NonEmpty LByteString
 
-executeStep :: Parser.Step -> [LByteString] -> MyMonad [LByteString]
-executeStep (Parser.Step s1) s2 = helper2 (toList s1) s2
-  where
-    helper2 :: [Parser.Section] -> [LByteString] -> MyMonad [LByteString]
-    helper2 [] _ = pure []
-    helper2 sections [] = helper2 sections $ repeat mempty
-    helper2 (section : sectionRest) streams@(stream : streamRest) =
-      case section of
-        Parser.SingleInput pipe -> (<>) <$> executePipe pipe stream <*> helper2 sectionRest streamRest
-        Parser.Merge (Parser.AtLeastTwo a (b :| rest)) -> do
-          let inputs = a :| b : rest
-              maxInput =
-                maximum1 $ inputs <&> \c -> case c of
-                  Parser.JustText _ -> 0
-                  Parser.Argument i -> i
-          mergeResult <-
-            fmap (B.concat . toList) $ for inputs $ \case
-              Parser.JustText txt -> pure $ encodeUtf8 txt
-              Parser.Argument i -> maybeToExceptT ("Couldn't find input from previous step for merge command for number: " <> show i) $ hoistMaybe $ streams !!? pred i
-          (mergeResult :) <$> helper2 sectionRest (drop maxInput streams)
-        Parser.Concat n ->
-          if n > length streams
-            then error $ "concat command required " <> show n <> " inputs, but only " <> show (length streams) <> " provided!"
-            else
-              let (toConcat, rest) = splitAt n streams
-               in fmap (mconcat toConcat :) $ helper2 sectionRest rest
+type Output = LByteString
 
-executePipe :: Parser.Pipe -> LByteString -> MyMonad [LByteString]
-executePipe (Parser.SinglePipe pipeCommand) stream = executePipeCommand pipeCommand stream
-executePipe (Parser.SharedPipe (Parser.AtLeastTwo x xs)) stream = concat <$> traverse (flip executePipeCommand stream) (x : toList xs)
+executeScript :: Parser.Script -> MyMonad Arguments
+executeScript (Parser.Script pipelines) = sconcat <$> traverse executePipeline pipelines
 
-executePipeCommand :: Parser.PipeCommand -> LByteString -> MyMonad [LByteString]
-executePipeCommand (Parser.PipelineCommand pipeline) stream = executePipeline pipeline stream
-executePipeCommand (Parser.SingleCommand command) stream = one <$> executeCommand command stream
+executePipeline :: Parser.Pipeline -> MyMonad Arguments
+executePipeline (Parser.Pipeline steps) = foldM (flip executeStep) (NonEmpty.repeat mempty) steps
 
-executeCommand :: Parser.Command -> LByteString -> MyMonad LByteString
-executeCommand (Parser.ReadLine prompt) _ = lift (TIO.putStr $ prompt <> " ") >> hFlush stdout >> helper
+executeStep :: Parser.Step -> Arguments -> MyMonad Arguments
+executeStep (Parser.Step sections) args =
+  let args' = args <> NonEmpty.repeat mempty
+   in sconcat <$> zipWithMN (\s a -> executeSection s a args') sections args'
+
+executeSection :: Parser.Section -> Input -> Arguments -> MyMonad Arguments
+executeSection (Parser.Section commands) input args = for commands $ \c -> executeCommand c input args
+
+executeCommand :: Parser.Command -> Input -> Arguments -> MyMonad Output
+executeCommand (Parser.ReadLine prompt) _ _ = lift (TIO.putStr $ prompt <> " ") >> hFlush stdout >> helper
   where
     helper = do
       bytes <- B.fromStrict <$> lift SB.getLine
       if B.null bytes
         then helper
         else pure bytes
-executeCommand Parser.PassThru s = pure s
-executeCommand (Parser.WriteLine text) stream =
-  lift (TIO.putStrLn text) $> stream
-executeCommand (Parser.WriteFile path) stream = lift (writeFileLBS (toString path) stream) $> mempty
-executeCommand (Parser.AppendFile path) stream = lift (appendFileLBS (toString path) stream) $> mempty
-executeCommand (Parser.ShowOutput cmd) stream = executeExternalCommand cmd stream True
-executeCommand (Parser.Command cmd) stream = executeExternalCommand cmd stream False
+executeCommand Parser.PassThru input _ = pure input
+executeCommand (Parser.WriteLine text) input _ =
+  lift (TIO.putStrLn text) $> input
+executeCommand (Parser.WriteFile path) input _ = lift (writeFileLBS (toString path) input) $> mempty
+executeCommand (Parser.AppendFile path) input _ = lift (appendFileLBS (toString path) input) $> mempty
+executeCommand (Parser.ShowOutput cmd) input args = executeExternalCommand cmd input args True
+executeCommand (Parser.Command cmd) input args = executeExternalCommand cmd input args False
+executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) _ args = createCmd (a :| b : rest) args
 
-executeExternalCommand :: Parser.ExternalCommand -> LByteString -> Bool -> MyMonad LByteString
-executeExternalCommand (Parser.ExternalCommand splits) stream isShow = do
-  arguments <- toText <<$>> lift getArgs
-  cmd <- fmap (Text.concat . toList) $ for splits $ \case
-    Parser.JustText t -> pure t
-    Parser.Argument i -> maybeToExceptT ("Couldn't find external argument for number: " <> show i) $ hoistMaybe $ arguments !!? i
+executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Bool -> MyMonad LByteString
+executeExternalCommand (Parser.ExternalCommand commandTexts) input internal isShow = do
+  cmd <- createCmd commandTexts internal
   (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
     hSetBinaryMode writeEnd True
-    B.hPut writeEnd stream
+    B.hPut writeEnd input
     hClose writeEnd
 
-    createProcess (shell $ toString cmd) {std_in = UseHandle readEnd, std_out = CreatePipe, std_err = CreatePipe}
+    createProcess (shell $ decodeUtf8 cmd) {std_in = UseHandle readEnd, std_out = CreatePipe, std_err = CreatePipe}
   case (mStdin, mStdout, mStderr) of
     (Nothing, Just out, Just err) -> do
       lift $ do
@@ -120,3 +99,11 @@ executeExternalCommand (Parser.ExternalCommand splits) stream isShow = do
         ExitSuccess -> pure outBytes
         ExitFailure _ -> throwError . decodeUtf8 $ errBytes <> outBytes
     _ -> throwError "Failed to create output handle"
+
+createCmd :: NonEmpty Parser.CommandText -> Arguments -> MyMonad LByteString
+createCmd commandTexts internal = do
+  arguments <- lift getArgs
+  flip foldMapM commandTexts $ \case
+    Parser.JustText t -> pure $ encodeUtf8 t
+    Parser.ExternalArgument i -> maybeToExceptT ("Couldn't find external argument for number: " <> show i) $ hoistMaybe $ fmap encodeUtf8 $ arguments !!? i
+    Parser.PipeArgument i -> maybeToExceptT ("Couldn't find internal argument for number: " <> show i) $ hoistMaybe $ toList internal !!? pred i

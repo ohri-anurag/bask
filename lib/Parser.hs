@@ -17,20 +17,7 @@ newtype Pipeline = Pipeline (NonEmpty Step)
 newtype Step = Step (NonEmpty Section)
   deriving (Show, Eq)
 
-data Section
-  = SingleInput Pipe
-  | Merge (AtLeastTwo CommandText)
-  | Concat Int
-  deriving (Show, Eq)
-
-data Pipe
-  = SinglePipe PipeCommand
-  | SharedPipe (AtLeastTwo PipeCommand)
-  deriving (Show, Eq)
-
-data PipeCommand
-  = PipelineCommand Pipeline
-  | SingleCommand Command
+newtype Section = Section (NonEmpty Command)
   deriving (Show, Eq)
 
 data Command
@@ -41,6 +28,7 @@ data Command
   | AppendFile Text
   | ShowOutput ExternalCommand
   | PassThru
+  | Concat (AtLeastTwo CommandText)
   deriving (Show, Eq)
 
 newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
@@ -48,7 +36,8 @@ newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
 
 data CommandText
   = JustText Text
-  | Argument Int
+  | ExternalArgument Int
+  | PipeArgument Int
   deriving (Show, Eq)
 
 data ParserState = ParserState
@@ -117,13 +106,19 @@ textBlock = Text.pack . reverse <$> helper []
 commandText :: Parser [CommandText]
 commandText =
   peek 1 >>= \case
-    "\n" -> pure []
     "$" -> do
       consume '$'
       st <- get
       nstr <- consumeWhile isDigit
-      n <- hoistEither . bimap (\e -> Error e st) Argument . readEither $ toString nstr
-      when (n == Argument 0) $ throwError $ Error "Arguments passed from bash must be numbered starting from 1!" st
+      n <- hoistEither . bimap (\e -> Error e st) ExternalArgument . readEither $ toString nstr
+      when (n == ExternalArgument 0) $ throwError $ Error "External Arguments must be numbered starting from 1!" st
+      (n :) <$> commandText
+    "#" -> do
+      consume '#'
+      st <- get
+      nstr <- consumeWhile isDigit
+      n <- hoistEither . bimap (\e -> Error e st) PipeArgument . readEither $ toString nstr
+      when (n == PipeArgument 0) $ throwError $ Error "Internal Arguments must be numbered starting from 1!" st
       (n :) <$> commandText
     _ -> helper []
   where
@@ -133,13 +128,21 @@ commandText =
         "||" -> toJust acc
         "==" -> toJust acc
         "\\$" -> string "\\$" *> helper ('$' : acc)
+        "\\#" -> string "\\#" *> helper ('#' : acc)
         s -> case Text.uncons s of
           Nothing -> toJust acc
           Just (c, _) ->
             case c of
               '$' -> (JustText (Text.pack $ reverse acc) :) <$> commandText
+              '#' -> (JustText (Text.pack $ reverse acc) :) <$> commandText
               '\n' -> toJust acc
               _ -> consume c *> helper (c : acc)
+
+externalCommand :: Parser ExternalCommand
+externalCommand =
+  commandText >>= \case
+    [] -> get >>= throwError . Error "Expected at least one word for this section/step!"
+    a : as -> pure $ ExternalCommand $ a :| as
 
 command :: Parser Command
 command =
@@ -153,50 +156,27 @@ command =
       peek 1 >>= \case
         " " -> consume ' ' $> PassThru
         _ -> pure PassThru
+    "concat" -> do
+      space
+      commandText >>= \case
+        a : b : rest -> pure . Concat . AtLeastTwo a $ b :| rest
+        _ -> get >>= throwError . Error "Expected at least two arguments for concat command!"
     w -> do
       modify $ \st@(ParserState {input}) -> st {input = w <> input}
       Command <$> externalCommand
-  where
-    externalCommand =
-      commandText >>= \case
-        [] -> get >>= throwError . Error "Expected at least one word for this section/step!"
-        a : as -> pure $ ExternalCommand $ a :| as
 
-pipeCommand :: Parser PipeCommand
-pipeCommand = SingleCommand <$> command
-
-pipe :: Parser Pipe
-pipe = do
-  a <- pipeCommand
-  helper >>= \case
-    [] -> pure $ SinglePipe a
-    b : rest -> pure $ SharedPipe (AtLeastTwo a (b :| rest))
+section :: Parser Section
+section = do
+  a <- command
+  (Section . (:|) a) <$> helper
   where
     helper = do
       peek 2 >>= \case
         "==" -> do
           string "==" *> space
-          a <- pipeCommand
-          (a :) <$> helper
+          b <- command
+          (b :) <$> helper
         _ -> pure []
-
-section :: Parser Section
-section =
-  word >>= \case
-    "merge" -> do
-      space
-      commandText >>= \case
-        a : b : rest -> pure . Merge . AtLeastTwo a $ b :| rest
-        _ -> get >>= throwError . Error "Expected at least two arguments for merge command!"
-    "concat" ->
-      space *> do
-        fmap (readMaybe . toString) textBlock >>= \case
-          Just i -> pure $ Concat i
-          Nothing -> get >>= throwError . Error ("concat command requires at least one integer!")
-    w -> do
-      st@ParserState {input} <- get
-      put st {input = w <> input}
-      SingleInput <$> pipe
 
 step :: Parser Step
 step = do
