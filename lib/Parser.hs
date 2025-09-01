@@ -165,54 +165,25 @@ command =
       modify $ \st@(ParserState {input}) -> st {input = w <> input}
       Command <$> externalCommand
 
-section :: Parser Section
-section = do
-  a <- command
-  (Section . (:|) a) <$> helper
+sepBy :: Parser a -> Text -> Parser (NonEmpty a)
+sepBy p s = (:|) <$> p <*> helper
   where
-    helper = do
-      peek 2 >>= \case
-        "==" -> do
-          string "==" *> space
-          b <- command
-          (b :) <$> helper
-        _ -> pure []
+    helper =
+      peek (Text.length s) >>= \str ->
+        if str == s
+          then do
+            string s
+            (:) <$> p <*> helper
+          else pure []
+
+section :: Parser Section
+section = Section <$> sepBy command "== "
 
 step :: Parser Step
-step = do
-  a <- section
-  (Step . (:|) a) <$> helper
-  where
-    helper = do
-      peek 2 >>= \case
-        "||" -> do
-          string "||" *> space
-          b <- section
-          (b :) <$> helper
-        _ -> pure []
+step = Step <$> sepBy section "|| "
 
 pipeline :: Parser Pipeline
-pipeline = do
-  a <- step
-  (Pipeline . (:|) a) <$> helper
-  where
-    helper = do
-      peek 2 >>= \case
-        "\n|" -> do
-          string "\n|" *> space
-          b <- step
-          (b :) <$> helper
-        _ -> pure []
+pipeline = Pipeline <$> sepBy step "\n| "
 
 script :: Parser Script
-script = do
-  a <- pipeline
-  (Script . (:|) a) <$> helper
-  where
-    helper = do
-      peek 2 >>= \case
-        "\n\n" -> do
-          string "\n\n"
-          b <- pipeline
-          (b :) <$> helper
-        _ -> pure []
+script = Script <$> sepBy pipeline "\n\n"
