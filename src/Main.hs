@@ -84,7 +84,13 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) intern
     B.hPut writeEnd input
     hClose writeEnd
 
-    createProcess (shell $ decodeUtf8 cmd) {std_in = UseHandle readEnd, std_out = CreatePipe, std_err = CreatePipe, cwd = toString <$> dir}
+    createProcess
+      (shell $ decodeUtf8 cmd)
+        { std_in = UseHandle readEnd,
+          std_out = if isShow then UseHandle stdout else CreatePipe,
+          std_err = CreatePipe,
+          cwd = toString <$> dir
+        }
   case (mStdin, mStdout, mStderr) of
     (Nothing, Just out, Just err) -> do
       lift $ do
@@ -92,17 +98,21 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) intern
         hSetBinaryMode err True
 
       errBytes <- lift $ B.hGetContents err
-      outBytes <-
-        if isShow
-          then do
-            lift $ B.hGetContents out >>= B.putStr
-            pure mempty
-          else lift $ B.hGetContents out
+      outBytes <- lift $ B.hGetContents out
 
       exitCode <- lift $ waitForProcess procHandle
       case exitCode of
         ExitSuccess -> pure (outBytes, dir)
         ExitFailure _ -> throwError . decodeUtf8 $ errBytes <> outBytes
+    (Nothing, Nothing, Just err) -> do
+      lift $ hSetBinaryMode err True
+
+      errBytes <- lift $ B.hGetContents err
+
+      exitCode <- lift $ waitForProcess procHandle
+      case exitCode of
+        ExitSuccess -> pure (mempty, dir)
+        ExitFailure _ -> throwError . decodeUtf8 $ errBytes
     _ -> throwError "Failed to create output handle"
 
 createCmd :: NonEmpty Parser.CommandText -> Arguments -> MyMonad LByteString
