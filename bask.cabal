@@ -100,4 +100,5 @@ executable bask
     , bask
     , bytestring
     , exceptions  ^>=0.10.7
+    , filepath
     , process

@@ -5,11 +5,13 @@ import Control.Monad.Except (throwError)
 import Data.ByteString.Char8 qualified as SB
 import Data.ByteString.Lazy.Char8 qualified as B
 import Data.List.NonEmpty qualified as NonEmpty
+import Data.Text qualified as Text
 import Data.Text.IO qualified as TIO
 import Data.Traversable (for)
 import Parser qualified as Parser
 import Relude
 import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
 import System.IO (hClose, hSetBinaryMode)
 import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
 
@@ -25,7 +27,7 @@ main = do
           ee <- runExceptT $ executeScript xs
           case ee of
             Left err -> TIO.putStrLn err *> exitFailure
-            Right out -> traverse_ B.putStrLn out
+            Right out -> traverse_ (B.putStrLn . fst) out
     [] -> putStrLn "Error: No arguments provided.\nbask requires a file path as an argument. This file should contain a bask script.\nUsage:\n\tbask <filepath>"
 
 zipWithMN :: (Applicative m) => (a -> b -> m c) -> NonEmpty a -> NonEmpty b -> m (NonEmpty c)
@@ -33,11 +35,11 @@ zipWithMN f (a :| as) (b :| bs) = (:|) <$> f a b <*> zipWithM f as bs
 
 type MyMonad = ExceptT Text IO
 
-type Input = LByteString
+type Input = (LByteString, Maybe Text)
 
-type Arguments = NonEmpty LByteString
+type Arguments = NonEmpty Input
 
-type Output = LByteString
+type Output = Input
 
 executeScript :: Parser.Script -> MyMonad Arguments
 executeScript (Parser.Script pipelines) = sconcat <$> traverse executePipeline pipelines
@@ -54,24 +56,27 @@ executeSection :: Parser.Section -> Input -> Arguments -> MyMonad Arguments
 executeSection (Parser.Section commands) input args = for commands $ \c -> executeCommand c input args
 
 executeCommand :: Parser.Command -> Input -> Arguments -> MyMonad Output
-executeCommand (Parser.ReadLine prompt) _ _ = lift (TIO.putStr $ prompt <> " ") >> hFlush stdout >> helper
+executeCommand (Parser.ReadLine prompt) (_, dir) _ = lift (TIO.putStr $ prompt <> " ") >> hFlush stdout >> helper
   where
     helper = do
       bytes <- B.fromStrict <$> lift SB.getLine
       if B.null bytes
         then helper
-        else pure bytes
+        else pure (bytes, dir)
 executeCommand Parser.PassThru input _ = pure input
 executeCommand (Parser.WriteLine text) input _ =
   lift (TIO.putStrLn text) $> input
-executeCommand (Parser.WriteFile path) input _ = lift (writeFileLBS (toString path) input) $> mempty
-executeCommand (Parser.AppendFile path) input _ = lift (appendFileLBS (toString path) input) $> mempty
+executeCommand (Parser.WriteFile path) (input, dir) _ = lift (writeFileLBS (foldMap toString dir </> toString path) input) $> (mempty, dir)
+executeCommand (Parser.AppendFile path) (input, dir) _ = lift (appendFileLBS (foldMap toString dir </> toString path) input) $> (mempty, dir)
 executeCommand (Parser.ShowOutput cmd) input args = executeExternalCommand cmd input args True
 executeCommand (Parser.Command cmd) input args = executeExternalCommand cmd input args False
-executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) _ args = createCmd (a :| b : rest) args
+executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) (_, dir) args = createCmd (a :| b : rest) args <&> \o -> (o, dir)
+executeCommand (Parser.ChangeDir pathInput) (input, _) args = do
+  path <- createCmd (pathInput :| []) args
+  pure (input, Just . Text.strip $ decodeUtf8 path)
 
-executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Bool -> MyMonad LByteString
-executeExternalCommand (Parser.ExternalCommand commandTexts) input internal isShow = do
+executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Bool -> MyMonad Output
+executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) internal isShow = do
   cmd <- createCmd commandTexts internal
   (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
@@ -79,7 +84,7 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) input internal isSh
     B.hPut writeEnd input
     hClose writeEnd
 
-    createProcess (shell $ decodeUtf8 cmd) {std_in = UseHandle readEnd, std_out = CreatePipe, std_err = CreatePipe}
+    createProcess (shell $ decodeUtf8 cmd) {std_in = UseHandle readEnd, std_out = CreatePipe, std_err = CreatePipe, cwd = toString <$> dir}
   case (mStdin, mStdout, mStderr) of
     (Nothing, Just out, Just err) -> do
       lift $ do
@@ -96,14 +101,15 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) input internal isSh
 
       exitCode <- lift $ waitForProcess procHandle
       case exitCode of
-        ExitSuccess -> pure outBytes
+        ExitSuccess -> pure (outBytes, dir)
         ExitFailure _ -> throwError . decodeUtf8 $ errBytes <> outBytes
     _ -> throwError "Failed to create output handle"
 
 createCmd :: NonEmpty Parser.CommandText -> Arguments -> MyMonad LByteString
 createCmd commandTexts internal = do
+  let internalArgs = fst <$> internal
   arguments <- lift getArgs
   flip foldMapM commandTexts $ \case
     Parser.JustText t -> pure $ encodeUtf8 t
     Parser.ExternalArgument i -> maybeToExceptT ("Couldn't find external argument for number: " <> show i) $ hoistMaybe $ fmap encodeUtf8 $ arguments !!? i
-    Parser.PipeArgument i -> maybeToExceptT ("Couldn't find internal argument for number: " <> show i) $ hoistMaybe $ toList internal !!? pred i
+    Parser.PipeArgument i -> maybeToExceptT ("Couldn't find internal argument for number: " <> show i) $ hoistMaybe $ toList internalArgs !!? pred i

@@ -29,6 +29,7 @@ data Command
   | ShowOutput ExternalCommand
   | PassThru
   | Concat (AtLeastTwo CommandText)
+  | ChangeDir CommandText
   deriving (Show, Eq)
 
 newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
@@ -120,6 +121,8 @@ commandText =
       n <- hoistEither . bimap (\e -> Error e st) PipeArgument . readEither $ toString nstr
       when (n == PipeArgument 0) $ throwError $ Error "Internal Arguments must be numbered starting from 1!" st
       (n :) <$> commandText
+    "\n" -> pure []
+    "" -> pure []
     _ -> helper []
   where
     toJust = pure . one . JustText . Text.pack . reverse
@@ -161,6 +164,12 @@ command =
       commandText >>= \case
         a : b : rest -> pure . Concat . AtLeastTwo a $ b :| rest
         _ -> get >>= throwError . Error "Expected at least two arguments for concat command!"
+    "cd" -> do
+      space
+      commandText >>= \case
+        [x] -> pure $ ChangeDir x
+        y -> error $ show y
+    -- get >>= throwError . Error "Expected one argument for cd command!"
     w -> do
       modify $ \st@(ParserState {input}) -> st {input = w <> input}
       Command <$> externalCommand
