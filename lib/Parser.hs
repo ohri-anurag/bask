@@ -30,6 +30,12 @@ data Command
   | PassThru
   | Concat (AtLeastTwo CommandText)
   | ChangeDir CommandText
+  | If Condition (NonEmpty CommandText) (NonEmpty CommandText)
+  deriving (Show, Eq)
+
+data Condition
+  = Exists CommandText
+  | Equals CommandText CommandText
   deriving (Show, Eq)
 
 newtype ExternalCommand = ExternalCommand (NonEmpty CommandText)
@@ -104,8 +110,8 @@ textBlock = Text.pack . reverse <$> helper []
               '$' -> consume '$' *> helper ('$' : acc)
               _ -> consume c *> helper (c : acc)
 
-commandText :: Parser [CommandText]
-commandText =
+singleCommandText :: Parser CommandText
+singleCommandText =
   peek 1 >>= \case
     "$" -> do
       consume '$'
@@ -113,39 +119,74 @@ commandText =
       nstr <- consumeWhile isDigit
       n <- hoistEither . bimap (\e -> Error e st) ExternalArgument . readEither $ toString nstr
       when (n == ExternalArgument 0) $ throwError $ Error "External Arguments must be numbered starting from 1!" st
-      (n :) <$> commandText
+      pure n
     "#" -> do
       consume '#'
       st <- get
       nstr <- consumeWhile isDigit
       n <- hoistEither . bimap (\e -> Error e st) PipeArgument . readEither $ toString nstr
       when (n == PipeArgument 0) $ throwError $ Error "Internal Arguments must be numbered starting from 1!" st
-      (n :) <$> commandText
-    "\n" -> pure []
-    "" -> pure []
+      pure n
     _ -> helper []
   where
-    toJust = pure . one . JustText . Text.pack . reverse
+    toJust = pure . JustText . Text.pack . reverse
     helper acc =
       peek 2 >>= \case
         "||" -> toJust acc
         "==" -> toJust acc
         "\\$" -> string "\\$" *> helper ('$' : acc)
         "\\#" -> string "\\#" *> helper ('#' : acc)
+        "\\n" -> string "\\n" *> helper ('\n' : acc)
         s -> case Text.uncons s of
           Nothing -> toJust acc
           Just (c, _) ->
             case c of
-              '$' -> (JustText (Text.pack $ reverse acc) :) <$> commandText
-              '#' -> (JustText (Text.pack $ reverse acc) :) <$> commandText
+              '$' -> pure . JustText . Text.pack $ reverse acc
+              '#' -> pure . JustText . Text.pack $ reverse acc
               '\n' -> toJust acc
               _ -> consume c *> helper (c : acc)
+
+commandText :: Parser [CommandText]
+commandText = do
+  a <- singleCommandText
+  rest <-
+    peek 2 >>= \case
+      "==" -> pure []
+      "||" -> pure []
+      _ ->
+        peek 1 >>= \case
+          "\n" -> pure []
+          "" -> pure []
+          _ -> commandText
+  pure $ a : rest
 
 externalCommand :: Parser ExternalCommand
 externalCommand =
   commandText >>= \case
     [] -> get >>= throwError . Error "Expected at least one word for this section/step!"
     a : as -> pure $ ExternalCommand $ a :| as
+
+condition :: Parser Condition
+condition = do
+  a <- singleCommandText
+  peek 1 >>= \case
+    "=" -> do
+      consume '='
+      space
+      Equals a <$> singleCommandText
+    _ -> pure $ Exists a
+
+thenBranch :: Parser (NonEmpty CommandText)
+thenBranch = do
+  a <- singleCommandText
+  (a :|) <$> helper
+  where
+    helper =
+      peek 5 >>= \case
+        " else" -> pure []
+        _ -> do
+          b <- singleCommandText
+          (b :) <$> helper
 
 command :: Parser Command
 command =
@@ -168,8 +209,17 @@ command =
       space
       commandText >>= \case
         [x] -> pure $ ChangeDir x
-        y -> error $ show y
-    -- get >>= throwError . Error "Expected one argument for cd command!"
+        _ -> get >>= throwError . Error "Expected one argument for cd command!"
+    "if" -> do
+      space
+      c <- condition
+      space
+      string "then "
+      a <- thenBranch
+      string " else "
+      commandText >>= \case
+        (b : rest) -> pure $ If c a (b :| rest)
+        _ -> get >>= throwError . Error "Expected at least one input for the else branch!"
     w -> do
       modify $ \st@(ParserState {input}) -> st {input = w <> input}
       Command <$> externalCommand

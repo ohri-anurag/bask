@@ -74,6 +74,21 @@ executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) (_, dir) args =
 executeCommand (Parser.ChangeDir pathInput) (input, _) args = do
   path <- createCmd (pathInput :| []) args
   pure (input, Just . Text.strip $ decodeUtf8 path)
+executeCommand (Parser.If cond th el) (_, dir) args = case cond of
+  Parser.Equals a b -> do
+    a' <- createCmd (a :| []) args
+    b' <- createCmd (b :| []) args
+    res <- if a' == b' then createCmd th args else createCmd el args
+    pure (res, dir)
+  Parser.Exists a -> do
+    branch <-
+      lift
+        ( runExceptT (createCmd (a :| []) args) >>= \case
+            Right _ -> pure th
+            Left _ -> pure el
+        )
+    res <- createCmd branch args
+    pure (res, dir)
 
 executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Bool -> MyMonad Output
 executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) internal isShow = do
