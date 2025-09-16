@@ -68,8 +68,10 @@ executeCommand (Parser.WriteLine text) input _ =
   lift (TIO.putStrLn text) $> input
 executeCommand (Parser.WriteFile path) (input, dir) _ = lift (writeFileLBS (foldMap toString dir </> toString path) input) $> (mempty, dir)
 executeCommand (Parser.AppendFile path) (input, dir) _ = lift (appendFileLBS (foldMap toString dir </> toString path) input) $> (mempty, dir)
-executeCommand (Parser.ShowOutput cmd) input args = executeExternalCommand cmd input args True
-executeCommand (Parser.Command cmd) input args = executeExternalCommand cmd input args False
+executeCommand (Parser.ShowOutput cmd) input args = executeExternalCommand cmd input args $ Just ShowOutput
+executeCommand (Parser.ReadInput cmd) input args = executeExternalCommand cmd input args $ Just ReadInput
+executeCommand (Parser.Interact cmd) input args = executeExternalCommand cmd input args $ Just ReadShow
+executeCommand (Parser.Command cmd) input args = executeExternalCommand cmd input args Nothing
 executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) (_, dir) args = createCmd (a :| b : rest) args <&> \o -> (o, dir)
 executeCommand (Parser.ChangeDir pathInput) (input, _) args = do
   path <- createCmd (pathInput :| []) args
@@ -90,8 +92,14 @@ executeCommand (Parser.If cond th el) (_, dir) args = case cond of
     res <- createCmd branch args
     pure (res, dir)
 
-executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Bool -> MyMonad Output
-executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) internal isShow = do
+data Interaction
+  = ReadInput
+  | ShowOutput
+  | ReadShow
+  deriving (Show, Eq)
+
+executeExternalCommand :: Parser.ExternalCommand -> Input -> Arguments -> Maybe Interaction -> MyMonad Output
+executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) internal interaction = do
   cmd <- createCmd commandTexts internal
   (mStdin, mStdout, mStderr, procHandle) <- lift $ do
     (readEnd, writeEnd) <- createPipe
@@ -101,9 +109,18 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) intern
 
     createProcess
       (shell $ decodeUtf8 cmd)
-        { std_in = UseHandle readEnd,
-          std_out = if isShow then UseHandle stdout else CreatePipe,
-          std_err = CreatePipe,
+        { std_in =
+            if interaction == Just ReadInput || interaction == Just ReadShow
+              then UseHandle stdin
+              else UseHandle readEnd,
+          std_out =
+            if interaction == Just ShowOutput || interaction == Just ReadShow
+              then UseHandle stdout
+              else CreatePipe,
+          std_err =
+            if interaction == Just ShowOutput || interaction == Just ReadShow
+              then UseHandle stderr
+              else CreatePipe,
           cwd = toString <$> dir
         }
   case (mStdin, mStdout, mStderr) of
@@ -119,15 +136,11 @@ executeExternalCommand (Parser.ExternalCommand commandTexts) (input, dir) intern
       case exitCode of
         ExitSuccess -> pure (outBytes, dir)
         ExitFailure _ -> throwError . decodeUtf8 $ errBytes <> outBytes
-    (Nothing, Nothing, Just err) -> do
-      lift $ hSetBinaryMode err True
-
-      errBytes <- lift $ B.hGetContents err
-
+    (Nothing, Nothing, Nothing) -> do
       exitCode <- lift $ waitForProcess procHandle
       case exitCode of
         ExitSuccess -> pure (mempty, dir)
-        ExitFailure _ -> throwError . decodeUtf8 $ errBytes
+        ExitFailure _ -> throwError "Command failed. Check stderr for details!"
     _ -> throwError "Failed to create output handle"
 
 createCmd :: NonEmpty Parser.CommandText -> Arguments -> MyMonad LByteString

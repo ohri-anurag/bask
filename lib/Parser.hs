@@ -27,6 +27,8 @@ data Command
   | WriteFile Text
   | AppendFile Text
   | ShowOutput ExternalCommand
+  | ReadInput ExternalCommand
+  | Interact ExternalCommand
   | PassThru
   | Concat (AtLeastTwo CommandText)
   | ChangeDir CommandText
@@ -196,6 +198,8 @@ command =
     "writefile" -> space *> fmap (WriteFile . Text.strip) textBlock
     "appendfile" -> space *> fmap (AppendFile . Text.strip) textBlock
     "show" -> space *> fmap ShowOutput externalCommand
+    "read" -> space *> fmap ReadInput externalCommand
+    "interact" -> space *> fmap Interact externalCommand
     "passthru" -> do
       peek 1 >>= \case
         " " -> consume ' ' $> PassThru
