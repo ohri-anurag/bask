@@ -99,6 +99,7 @@ executable bask
   build-depends:
     , bask
     , bytestring
+    , directory
     , exceptions  ^>=0.10.7
     , filepath
     , process

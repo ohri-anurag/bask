@@ -10,8 +10,9 @@ import Data.Text.IO qualified as TIO
 import Data.Traversable (for)
 import Parser qualified as Parser
 import Relude
+import System.Directory (makeAbsolute)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (isRelative, (</>))
 import System.IO (hClose, hSetBinaryMode)
 import System.Process (CreateProcess (..), StdStream (..), createPipe, createProcess, shell, waitForProcess)
 
@@ -73,9 +74,14 @@ executeCommand (Parser.ReadInput cmd) input args = executeExternalCommand cmd in
 executeCommand (Parser.Interact cmd) input args = executeExternalCommand cmd input args $ Just ReadShow
 executeCommand (Parser.Command cmd) input args = executeExternalCommand cmd input args Nothing
 executeCommand (Parser.Concat (Parser.AtLeastTwo a (b :| rest))) (_, dir) args = createCmd (a :| b : rest) args <&> \o -> (o, dir)
-executeCommand (Parser.ChangeDir pathInput) (input, _) args = do
-  path <- createCmd (pathInput :| []) args
-  pure (input, Just . Text.strip $ decodeUtf8 path)
+executeCommand (Parser.ChangeDir pathInput) (input, prevPath) args = do
+  pathBstr <- createCmd (pathInput :| []) args
+  let path = decodeUtf8 pathBstr
+  newPath <-
+    if isRelative path
+      then fmap toText $ liftIO $ makeAbsolute $ toString (fold prevPath) </> path
+      else pure $ decodeUtf8 pathBstr
+  pure (input, Just $ Text.strip newPath)
 executeCommand (Parser.If cond th el) (_, dir) args = case cond of
   Parser.Equals a b -> do
     a' <- createCmd (a :| []) args
